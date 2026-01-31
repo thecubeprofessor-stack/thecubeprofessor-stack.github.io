@@ -8,8 +8,6 @@
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/dracula.min.css">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/meta.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/plaintext/plaintext.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/matchbrackets.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/selection/active-line.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/closebrackets.min.js"></script>
@@ -64,7 +62,7 @@
       font-size: 13px;
       border-radius: 12px;
       overflow: auto; /* enable scroll */
-      white-space: nowrap; /* prevent line wrap */
+      white-space: pre;
       flex: 1;
     }
     #right {
@@ -239,17 +237,26 @@ const editor = CodeMirror.fromTextArea(document.getElementById("editor"), {
   highlightSelectionMatches: true,
   lint: true,
   gutters: ["CodeMirror-linenumbers", "CodeMirror-lint-markers"],
+  lineWrapping: true,
+  viewportMargin: Infinity,
+});
+
+/* Ensure editor always remains editable */
+editor.setOption("readOnly", false);
+editor.setOption("cursorBlinkRate", 530);
+
+/* Keep file contents synced with editor so code can be edited and run repeatedly */
+editor.on("change", () => {
+  if (currentFile) {
+    files[currentFile] = editor.getValue();
+  }
 });
 
 function openFile(name, content){
   files[name] = content;
   currentFile = name;
   editor.setValue(content);
-  if(name.endsWith('.txt')){
-    editor.setOption('mode','text/plain');
-  } else {
-    editor.setOption('mode','python');
-  }
+  editor.setOption('mode','python');
   document.getElementById('currentFileName').textContent = name;
   renderTabs();
   renderFileTree();
@@ -266,11 +273,7 @@ function renderTabs(){
       files[currentFile]=editor.getValue();
       currentFile=f;
       editor.setValue(files[f]);
-      if(f.endsWith('.txt')){
-        editor.setOption('mode','text/plain');
-      } else {
-        editor.setOption('mode','python');
-      }
+      editor.setOption('mode','python');
       document.getElementById('currentFileName').textContent = f;
       renderTabs();
       renderFileTree(); // <- ensure sidebar updates
@@ -296,11 +299,7 @@ function renderFileTree(){
       files[currentFile]=editor.getValue();
       currentFile=f;
       editor.setValue(files[f]);
-      if(f.endsWith('.txt')){
-        editor.setOption('mode','text/plain');
-      } else {
-        editor.setOption('mode','python');
-      }
+      editor.setOption('mode','python');
       document.getElementById('currentFileName').textContent = f;
       renderTabs();
       renderFileTree();
@@ -406,6 +405,8 @@ editor.addKeyMap({
 });
 
 async function runCode(){
+  const startTime = performance.now();
+  if(currentFile) files[currentFile] = editor.getValue();
   const out = document.getElementById('output');
   out.textContent = '';
   appendOutputLine('Running code...', true);
@@ -416,44 +417,48 @@ async function runCode(){
   Object.keys(files).forEach(f=>{
     if(f.endsWith('.txt')){
       const varName = f.replace(/\.txt$/,'').replace(/\W/g,'_');
-      // inject .txt content as variable for main.py to use
-      txtVars += `${varName} = '''${files[f]}'''\n`;
+      txtVars += `${varName} = """${files[f]}"""\n`;
     }
   });
 
   const userCode = files['main.py'] || '';
 
+  // Build Python code
   const code = `
 import sys
 from io import StringIO
 import builtins
-
 import js
-def input(prompt=""):
-    print(prompt, end='', flush=True)
-    return js.prompt(prompt)
-
-builtins.input = input
 
 buffer = StringIO()
 sys.stdout = buffer
 sys.stderr = buffer
 
-try:
-# --- linked .txt files ---
-${txtVars.split('\n').map(line => line ? '    ' + line : '').join('\n')}
-${userCode.split('\n').map(line => '    ' + line).join('\n')}
-except Exception as e:
-    raise e
-finally:
-    sys.stdout = sys.__stdout__
-    sys.stderr = sys.__stderr__
+# Use standard prompt() for input and echo prompt + value to output
+def input(prompt=""):
+    val = js.prompt(prompt)
+    if val is None:
+        val = ""
+    if prompt:
+        print(prompt, end="")
+    print(val)
+    return val
+
+builtins.input = input
+
+# Inject txt variables
+${txtVars.split('\n').map(line => line ? line : '').join('\n')}
+
+# User code
+${userCode}
 
 buffer.getvalue()
 `;
 
   try{
-    const outputBuffer = await pyodide.runPythonAsync(code);
+    let outputBuffer = await pyodide.runPythonAsync(code);
+    if(!outputBuffer) outputBuffer = '';
+    outputBuffer = String(outputBuffer);
     outputBuffer.split('\n').forEach(line => appendOutputLine(line));
   } catch(err){
     appendOutputLine(err.toString());
@@ -461,23 +466,21 @@ buffer.getvalue()
     if(match){
       const line = parseInt(match[1],10)-1;
       if(err.toString().startsWith('SyntaxError')){
-        const lineText = editor.getLine(line);
         const colMatch = err.toString().match(/column (\d+)/);
         if(colMatch){
           const ch = Math.max(0, parseInt(colMatch[1],10)-1);
-          editor.markText(
-            { line, ch },
-            { line, ch: ch + 1 },
-            { className: 'cm-error' }
-          );
+          editor.markText({ line, ch }, { line, ch: ch + 1 }, { className: 'cm-error' });
         }
       } else {
         editor.markText({line,ch:0},{line,ch:editor.getLine(line).length},{className:'error-line'});
       }
     }
   }
-  const elapsed = ((performance.now() - performance.now())/1000).toFixed(3);
+
+  const elapsed = ((performance.now() - startTime)/1000).toFixed(3);
   appendOutputLine(`Finished in ${elapsed} seconds`, true);
+  /* Return focus to editor so user can keep editing and rerunning */
+  editor.focus();
 }
 
 function saveFile(){
@@ -538,16 +541,6 @@ function inputHintListener(cm, change) {
 // attach initially
 editor.on("inputRead", inputHintListener);
 
-document.getElementById('toggleHintsBtn').addEventListener('click', () => {
-  hintsEnabled = !hintsEnabled;
-  if(hintsEnabled){
-    editor.on("inputRead", inputHintListener);
-    appendOutputLine('Hints enabled', true);
-  } else {
-    editor.off("inputRead", inputHintListener);
-    appendOutputLine('Hints disabled', true);
-  }
-});
 </script>
 <script>
 // Sidebar toggle button functionality
@@ -562,3 +555,4 @@ document.getElementById('toggleSidebarBtn').addEventListener('click', () => {
 </script>
 </body>
 </html>
+
